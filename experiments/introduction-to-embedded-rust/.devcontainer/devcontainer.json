@@ -1,0 +1,31 @@
+{
+	"name": "Development Environment for Introduction to Embedded Rust",
+	"image": "env-embedded-rust:latest",
+	"workspaceMount": "source=${localWorkspaceFolder}/workspace,target=/home/student/workspace,type=bind",
+	"workspaceFolder": "/home/student/workspace",
+	"features": {},
+	"forwardPorts": [3000, 33033],
+	"postCreateCommand": "/usr/local/bin/entrypoint.sh",
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"mcu-debug.debug-tracker-vscode",
+				"marus25.cortex-debug"
+			],
+			"settings": {
+				"terminal.integrated.defaultProfile.linux": "bash",
+				"terminal.integrated.profiles.linux": {
+					"bash": {
+						"path": "/bin/bash",
+						"icon": "terminal-bash"
+					}
+				}
+			}
+		}
+	},
+	"runArgs": [
+        "--rm",
+        "-it"
+    ]
+}
