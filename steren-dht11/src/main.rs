@@ -8,17 +8,17 @@ use core::panic::PanicInfo;
 use rp235x_hal as hal;
 
 mod dht11;
-use dht11::{Dht11, DhtInputPin, DhtOutputPin};
+use dht11::Dht11;
 
 // Import traits for embedded abstractions.
-// use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::InputPin;
 use embedded_hal::digital::OutputPin;
-// use embedded_hal::digital::StatefulOutputPin;
 
 // USB device and communications class device (CDC) support
-// use usb_device::{class_prelude::*, prelude::*};
-// use usbd_serial::SerialPort;
+use usb_device::{class_prelude::*, prelude::*};
+use usbd_serial::{SerialPort, USB_CLASS_CDC};
+
+use core::fmt::Write;
+use heapless::String;
 
 // Panic handler just loops indefinitely.
 #[panic_handler]
@@ -33,69 +33,6 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 // Set external crystal frequency for the system clock.
 const XOSC_CRYSTAL_FREQ: u32 = 12_000_000; // 12 MHz external crystal frequency
-
-fn dht_handshake(
-    timer: &hal::Timer<hal::timer::CopyableTimer0>,
-    mut dht_pin: DhtOutputPin,
-) -> Result<DhtInputPin, HandshakeError> {
-    // 1. MCU sends the start signal.
-    dht_pin.set_low().unwrap();
-
-    let start = timer.get_counter();
-    while (timer.get_counter() - start).to_millis() < 18 {}
-
-    // 2. Release DATA. External pull-up restores HIGH.
-    let mut dht_pin = dht_pin.into_floating_input();
-
-    // 3. Wait for the initial LOW response.
-    let start = timer.get_counter();
-
-    loop {
-        if dht_pin.is_low().unwrap() {
-            break;
-        }
-
-        if (timer.get_counter() - start).to_micros() >= 120 {
-            return Err(HandshakeError::NoInitialLow);
-        }
-    }
-
-    // 4. Measure the LOW response pulse.
-    let start = timer.get_counter();
-
-    let low_us = loop {
-        if dht_pin.is_high().unwrap() {
-            break (timer.get_counter() - start).to_micros();
-        }
-
-        if (timer.get_counter() - start).to_micros() >= 150 {
-            return Err(HandshakeError::LowDidNotEnd);
-        }
-    };
-
-    if !(50..=110).contains(&low_us) {
-        return Err(HandshakeError::LowInvalidDuration);
-    }
-
-    // 5. Measure the HIGH response pulse.
-    let start = timer.get_counter();
-
-    let high_us = loop {
-        if dht_pin.is_low().unwrap() {
-            break (timer.get_counter() - start).to_micros();
-        }
-
-        if (timer.get_counter() - start).to_micros() >= 150 {
-            return Err(HandshakeError::HighDidNotEnd);
-        }
-    };
-
-    if !(50..=110).contains(&high_us) {
-        return Err(HandshakeError::HighInvalidDuration);
-    }
-
-    Ok(dht_pin)
-}
 
 // Main entry point for the program.
 #[hal::entry]
@@ -140,75 +77,90 @@ fn main() -> ! {
     let mut green_led = pins.gpio16.into_push_pull_output();
 
     // ---- DHT11 SETUP ----
-
     // Allow the sensor to stabilize after power-on.
     let start = timer.get_counter();
     while (timer.get_counter() - start).to_millis() < 2_000 {}
 
-    let _dht_pin: Dht11 = Dht11::new(pins.gpio15.into_floating_input());
+    let mut dht11: Dht11 = Dht11::new(pins.gpio15.into_floating_input());
 
-    // let result = dht_handshake(&timer, dht_pin);
+    // ---- USB SETUP ----
+    // Initialize the USB driver
+    let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
+        pac.USB,
+        pac.USB_DPRAM,
+        clocks.usb_clock,
+        true,
+        &mut pac.RESETS,
+    ));
 
-    // if result.is_ok() {
-    //     green_led.set_high().unwrap();
-    //     red_led.set_low().unwrap();
-    // } else {
-    //     red_led.set_high().unwrap();
-    //     green_led.set_low().unwrap();
-    // }
+    // Configure the USB as CDC
+    let mut serial = SerialPort::new(&usb_bus);
 
-    loop {}
+    // Create a USB device with fake VID and PID
+    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
+        .strings(&[StringDescriptors::default()
+            .manufacturer("Fake Manufacturer")
+            .product("Serial Port")
+            .serial_number("12345678")])
+        .unwrap()
+        .device_class(USB_CLASS_CDC) // from: https://www.usb.org/defined-class-codes
+        .build();
 
-    // // ---- USB SETUP ----
-    // // Initialize the USB driver
-    // let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
-    //     pac.USB,
-    //     pac.USB_DPRAM,
-    //     clocks.usb_clock,
-    //     true,
-    //     &mut pac.RESETS,
-    // ));
+    let mut last_read = timer.get_counter();
+    let mut buffer: String<128> = String::new();
+    let mut tx_offset = 0usize;
+    let mut tx_pending = false;
+    loop {
+        // Keep USB communication alive.
+        usb_dev.poll(&mut [&mut serial]);
 
-    // // Configure the USB as CDC
-    // let mut serial = SerialPort::new(&usb_bus);
+        // Flush pending USB output without blocking.
+        if tx_pending {
+            match serial.write(&buffer.as_bytes()[tx_offset..]) {
+                Ok(n) if n > 0 => {
+                    tx_offset += n;
 
-    // // Create a USB device with fake VID and PID
-    // let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
-    //     .strings(&[StringDescriptors::default()
-    //         .manufacturer("Fake Manufacturer")
-    //         .product("Serial Port")
-    //         .serial_number("12345678")])
-    //     .unwrap()
-    //     .device_class(2) // from: https://www.usb.org/defined-class-codes
-    //     .build();
+                    if tx_offset == buffer.len() {
+                        tx_pending = false;
+                    }
+                }
+                Ok(_) | Err(usb_device::UsbError::WouldBlock) => {}
+                Err(_) => {
+                    tx_pending = false;
+                }
+            }
+        }
 
-    // // Read buffer
-    // let mut rx_buf = [0u8; 64];
+        // Run a new DHT11 transaction every 2 seconds.
+        if (timer.get_counter() - last_read).to_millis() >= 2_000 {
+            last_read = timer.get_counter();
 
-    // // Superloop
-    // let mut timestamp = timer.get_counter();
-    // let mut led_state = false;
-    // loop {
-    //     if usb_dev.poll(&mut [&mut serial]) {
-    //         match serial.read(&mut rx_buf) {
-    //             Ok(0) => {}
-    //             Ok(_count) => {}
-    //             Err(_e) => {}
-    //         }
-    //     }
+            match dht11.read(&timer) {
+                Ok(measurement) => {
+                    green_led.set_high().unwrap();
+                    red_led.set_low().unwrap();
 
-    //     // Send message every second (non-blocking)
-    //     if (timer.get_counter() - timestamp).to_millis() >= 1_000 {
-    //         timestamp = timer.get_counter();
-    //         let _ = serial.write(b"Hello, world!\r\n");
+                    // Do not overwrite a message still being sent.
+                    if !tx_pending {
+                        buffer.clear();
 
-    //         // Toggle LED state every second
-    //         led_state = !led_state;
-    //         if led_state {
-    //             red_led.set_high().unwrap();
-    //         } else {
-    //             red_led.set_low().unwrap();
-    //         }
-    //     }
-    // }
+                        write!(
+                            &mut buffer,
+                            "[DHT11] Temperature: {} C | Humidity: {}%\r\n",
+                            measurement.temperature_integer, measurement.humidity_integer,
+                        )
+                        .unwrap();
+
+                        tx_offset = 0;
+                        tx_pending = true;
+                    }
+                }
+
+                Err(_) => {
+                    red_led.set_high().unwrap();
+                    green_led.set_low().unwrap();
+                }
+            }
+        }
+    }
 }
