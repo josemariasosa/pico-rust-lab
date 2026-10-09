@@ -7,6 +7,9 @@ use core::panic::PanicInfo;
 // Alias our HAL.
 use rp235x_hal as hal;
 
+mod dht11;
+use dht11::{Dht11, DhtInputPin, DhtOutputPin};
+
 // Import traits for embedded abstractions.
 // use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::InputPin;
@@ -31,64 +34,67 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 // Set external crystal frequency for the system clock.
 const XOSC_CRYSTAL_FREQ: u32 = 12_000_000; // 12 MHz external crystal frequency
 
-enum HandshakeResult {
-    Ok,
-    NoInitialLow,
-    LowDidNotEnd,
-    HighDidNotEnd,
-}
-
 fn dht_handshake(
-    timer: hal::Timer<hal::timer::CopyableTimer0>,
-    mut dht_pin: hal::gpio::Pin<
-        hal::gpio::bank0::Gpio15,
-        hal::gpio::FunctionSio<hal::gpio::SioOutput>,
-        hal::gpio::PullDown,
-    >,
-) -> HandshakeResult {
+    timer: &hal::Timer<hal::timer::CopyableTimer0>,
+    mut dht_pin: DhtOutputPin,
+) -> Result<DhtInputPin, HandshakeError> {
+    // 1. MCU sends the start signal.
     dht_pin.set_low().unwrap();
 
     let start = timer.get_counter();
     while (timer.get_counter() - start).to_millis() < 18 {}
 
-    // dht_pin.set_high().unwrap();
-
-    // let start = timer.get_counter();
-    // while (timer.get_counter() - start).to_micros() < 30 {}
-
-    // Release the bus immediately.
-    // External 10k pull-up should bring DATA high.
-
+    // 2. Release DATA. External pull-up restores HIGH.
     let mut dht_pin = dht_pin.into_floating_input();
 
+    // 3. Wait for the initial LOW response.
     let start = timer.get_counter();
-    while dht_pin.is_high().unwrap() {
-        if (timer.get_counter() - start).to_micros() > 100 {
-            return HandshakeResult::NoInitialLow;
+
+    loop {
+        if dht_pin.is_low().unwrap() {
+            break;
+        }
+
+        if (timer.get_counter() - start).to_micros() >= 120 {
+            return Err(HandshakeError::NoInitialLow);
         }
     }
 
-    // We already detected that the DHT11 pulled DATA low.
-
-    // 1. Wait for the response LOW pulse to finish.
-    //    LOW -> HIGH
+    // 4. Measure the LOW response pulse.
     let start = timer.get_counter();
-    while dht_pin.is_low().unwrap() {
-        if (timer.get_counter() - start).to_micros() > 120 {
-            return HandshakeResult::LowDidNotEnd;
+
+    let low_us = loop {
+        if dht_pin.is_high().unwrap() {
+            break (timer.get_counter() - start).to_micros();
         }
+
+        if (timer.get_counter() - start).to_micros() >= 150 {
+            return Err(HandshakeError::LowDidNotEnd);
+        }
+    };
+
+    if !(50..=110).contains(&low_us) {
+        return Err(HandshakeError::LowInvalidDuration);
     }
 
-    // 2. Wait for the response HIGH pulse to finish.
-    //    HIGH -> LOW
+    // 5. Measure the HIGH response pulse.
     let start = timer.get_counter();
-    while dht_pin.is_high().unwrap() {
-        if (timer.get_counter() - start).to_micros() > 120 {
-            return HandshakeResult::HighDidNotEnd;
+
+    let high_us = loop {
+        if dht_pin.is_low().unwrap() {
+            break (timer.get_counter() - start).to_micros();
         }
+
+        if (timer.get_counter() - start).to_micros() >= 150 {
+            return Err(HandshakeError::HighDidNotEnd);
+        }
+    };
+
+    if !(50..=110).contains(&high_us) {
+        return Err(HandshakeError::HighInvalidDuration);
     }
 
-    HandshakeResult::Ok
+    Ok(dht_pin)
 }
 
 // Main entry point for the program.
@@ -135,121 +141,23 @@ fn main() -> ! {
 
     // ---- DHT11 SETUP ----
 
-    // Give the DHT11 time to stabilize after power-on.
+    // Allow the sensor to stabilize after power-on.
     let start = timer.get_counter();
     while (timer.get_counter() - start).to_millis() < 2_000 {}
 
-    // Start signal.
-    let mut dht_pin = pins.gpio15.into_push_pull_output();
+    let _dht_pin: Dht11 = Dht11::new(pins.gpio15.into_floating_input());
 
-    dht_pin.set_low().unwrap();
+    // let result = dht_handshake(&timer, dht_pin);
 
-    let start = timer.get_counter();
-    while (timer.get_counter() - start).to_millis() < 18 {}
-
-    // Release DATA.
-    let mut dht_pin = dht_pin.into_floating_input();
-
-    // Diagnostic timeout intentionally much longer than protocol timing.
-    let start = timer.get_counter();
-
-    let responded = loop {
-        if dht_pin.is_low().unwrap() {
-            break true;
-        }
-
-        if (timer.get_counter() - start).to_micros() > 1_000 {
-            break false;
-        }
-    };
-
-    if responded {
-        green_led.set_high().unwrap();
-        red_led.set_low().unwrap();
-    } else {
-        red_led.set_high().unwrap();
-        green_led.set_low().unwrap();
-    }
+    // if result.is_ok() {
+    //     green_led.set_high().unwrap();
+    //     red_led.set_low().unwrap();
+    // } else {
+    //     red_led.set_high().unwrap();
+    //     green_led.set_low().unwrap();
+    // }
 
     loop {}
-
-    // let dht_pin = pins.gpio15.into_push_pull_output();
-    // let handshake_result = dht_handshake(timer, dht_pin);
-
-    // loop {
-    //     match handshake_result {
-    //         HandshakeResult::Ok => {
-    //             red_led.set_low().unwrap();
-
-    //             green_led.set_high().unwrap();
-
-    //             let start = timer.get_counter();
-    //             while (timer.get_counter() - start).to_millis() < 250 {}
-
-    //             green_led.set_low().unwrap();
-
-    //             let start = timer.get_counter();
-    //             while (timer.get_counter() - start).to_millis() < 250 {}
-    //         }
-
-    //         HandshakeResult::NoInitialLow => {
-    //             green_led.set_low().unwrap();
-
-    //             // 1 blink
-    //             red_led.set_high().unwrap();
-
-    //             let start = timer.get_counter();
-    //             while (timer.get_counter() - start).to_millis() < 150 {}
-
-    //             red_led.set_low().unwrap();
-
-    //             let start = timer.get_counter();
-    //             while (timer.get_counter() - start).to_millis() < 800 {}
-    //         }
-
-    //         HandshakeResult::LowDidNotEnd => {
-    //             green_led.set_low().unwrap();
-
-    //             // 2 blinks
-    //             for _ in 0..2 {
-    //                 red_led.set_high().unwrap();
-
-    //                 let start = timer.get_counter();
-    //                 while (timer.get_counter() - start).to_millis() < 150 {}
-
-    //                 red_led.set_low().unwrap();
-
-    //                 let start = timer.get_counter();
-    //                 while (timer.get_counter() - start).to_millis() < 150 {}
-    //             }
-
-    //             // Pause between groups
-    //             let start = timer.get_counter();
-    //             while (timer.get_counter() - start).to_millis() < 700 {}
-    //         }
-
-    //         HandshakeResult::HighDidNotEnd => {
-    //             green_led.set_low().unwrap();
-
-    //             // 3 blinks
-    //             for _ in 0..3 {
-    //                 red_led.set_high().unwrap();
-
-    //                 let start = timer.get_counter();
-    //                 while (timer.get_counter() - start).to_millis() < 150 {}
-
-    //                 red_led.set_low().unwrap();
-
-    //                 let start = timer.get_counter();
-    //                 while (timer.get_counter() - start).to_millis() < 150 {}
-    //             }
-
-    //             // Pause between groups
-    //             let start = timer.get_counter();
-    //             while (timer.get_counter() - start).to_millis() < 700 {}
-    //         }
-    //     }
-    // }
 
     // // ---- USB SETUP ----
     // // Initialize the USB driver
